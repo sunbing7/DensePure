@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForImageClassification, AutoFeatureExtractor
 import timm
 from networks import *
+from my_utils.data import get_data, get_data_specs
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
@@ -40,6 +41,11 @@ class DensePure_Certify(nn.Module):
                 checkpoint = torch.load('../wide-resnet.pytorch/checkpoint/cifar10/wide-resnet-28x10.t7')
                 self.classifier = checkpoint['net'].cuda()
                 self.classifier.training = False
+            elif args.advanced_classifier=='cifar10-wideresnet':
+                self.classifier = WideResNet()
+                self.classifier.eval()
+                model_weights_path = '/root/autodl-tmp/sunbing/workspace/uap/my_result/uap_virtual_data.pytorch/models/cifar10_wideresnet_123/wideresnet_cifar10.pth'
+                self.classifier.load_state_dict(torch.load(model_weights_path, map_location=torch.device('cpu')))
             else:
                 raise NotImplementedError('no classifier')
         elif args.domain == 'imagenet':
@@ -80,7 +86,7 @@ class DensePure_Certify(nn.Module):
 
     def forward(self, x, sample_id):
         counter = self.counter.item()
-        if counter % 5 == 0:
+        if counter % 100 == 0:
             print(f'diffusion times: {counter}')
 
         start_time = time()
@@ -95,11 +101,12 @@ class DensePure_Certify(nn.Module):
                 x_re = F.interpolate(x_re, size=(512, 512), mode='bicubic')
             else:
                 x_re = F.interpolate(x_re, size=(224, 224), mode='bicubic')
-
+        '''
         if counter % 5 == 0:
             print(f'x shape (before diffusion models): {x.shape}')
             print(f'x shape (before classifier): {x_re.shape}')
             print("Sampling time per batch: {:0>2}:{:05.2f}".format(int(minutes), seconds))
+        '''
 
         if self.args.advanced_classifier=='vit':
             self.classifier.eval()
@@ -322,7 +329,7 @@ def original_certify(dataset, args, config):
                 i, label, prediction, radius, correct, time_elapsed), file=f, flush=True)
         f.close()        
 
-def purified_certify(model, dataset, args, config):
+def purified_certify(model, dataset, args, config, uap_test=False, uap=None):
     # ---------------- evaluate certified robustness of diffpure + classifier ----------------
     ngpus = torch.cuda.device_count()
     model_ = model
@@ -332,13 +339,18 @@ def purified_certify(model, dataset, args, config):
     print(f'apply the attack to diffpure + classifier [{args.lp_norm}]...')
     model_.reset_counter()
     smoothed_classifier_diffpure = Smooth(model, get_num_classes(args.domain), args.sigma)
-    f = open(args.outfile+'_diffpure', 'w')
-    print("idx\tlabel\tpredict\tradius\tcorrect\ttime", file=f, flush=True)
-
+    #f = open(args.outfile+'_diffpure', 'w')
+    f = open(args.outfile, 'w')
+    if uap_test:
+        print("idx\tlabel\tpredict\tpredict_adv\tradius\tcorrect\ttime", file=f, flush=True)
+    else:
+        print("idx\tlabel\tpredict\tradius\tcorrect\ttime", file=f, flush=True)
     # iterate through the dataset
     if args.use_id:
         for i in args.sample_id:
             (x, label) = dataset[i]
+            if uap_test:
+                x = (x + uap[0]).float()
 
             before_time = time()
             # certify the prediction of g around x
@@ -364,20 +376,35 @@ def purified_certify(model, dataset, args, config):
             if i == args.max:
                 break
             (x, label) = dataset[i]
+            if uap_test:
+                x_adv = (x + uap[0]).float()
+                x_adv = x_adv.cuda()
 
             before_time = time()
             # certify the prediction of g around x
             x = x.cuda()
             label = torch.tensor(label,dtype=torch.int).cuda()
             prediction, radius, n0_predictions, n_predictions = smoothed_classifier_diffpure.certify(x, args.N0, args.N, i, args.alpha, args.certified_batch, args.clustering_method)
+            if uap_test:
+                prediction_adv, radius, n0_predictions_adv, n_predictions_adv = smoothed_classifier_diffpure.certify(x_adv, args.N0, args.N,
+                                                                                                         i, args.alpha,
+                                                                                                         args.certified_batch,
+                                                                                                         args.clustering_method)
             after_time = time()
             correct = int(prediction == label)
             time_elapsed = str(datetime.timedelta(seconds=(after_time - before_time)))
-            print("{}\t{}\t{}\t{:.3}\t{}\t{}".format(
-                i, label, prediction, radius, correct, time_elapsed), file=f, flush=True)
+            if uap_test:
+                print("{}\t{}\t{}\t{}\t{:.3}\t{}\t{}".format(
+                    i, label, prediction, prediction_adv, radius, correct, time_elapsed), file=f, flush=True)
+            else:
+                print("{}\t{}\t{}\t{:.3}\t{}\t{}".format(
+                    i, label, prediction, radius, correct, time_elapsed), file=f, flush=True)
             if args.save_predictions:
                 np.save(args.predictions_path+str(i)+'-'+str(args.reverse_seed)+'-n0_predictions.npy',n0_predictions)
                 np.save(args.predictions_path+str(i)+'-'+str(args.reverse_seed)+'-n_predictions.npy',n_predictions)
+                if uap_test:
+                    np.save(args.predictions_path+str(i)+'-'+str(args.reverse_seed)+'-n0_predictions_adv.npy',n0_predictions_adv)
+                    np.save(args.predictions_path+str(i)+'-'+str(args.reverse_seed)+'-n_predictions_adv.npy',n_predictions_adv)
         f.close()
 
 
@@ -398,13 +425,24 @@ def robustness_eval(args, config):
 
     # load dataset
     dataset = get_dataset(args.domain, 'test')
+    print('[Debug] test data size : {}'.format(len(dataset)))
+    #_, data_test = get_data(args.domain, args.domain)
+    #dataset = data_test
+
+    # load uap
+    tuap = None
+    if args.uap_test:
+        num_classes, (mean, std), input_size, num_channels = get_data_specs(args.domain)
+        uap_fn = os.path.join(args.uap_path, 'uap_' + str(args.uap_target) + '.npy')
+        uap = np.load(uap_fn) / np.array(std).reshape(1, 3, 1, 1)
+        tuap = torch.from_numpy(uap)
 
     # eval classifier and sde_adv against attacks
     if args.certify_mode == 'both':
         original_certify(dataset, args, config)
         purified_certify(model, dataset, args, config)
     elif args.certify_mode == 'purify':
-        purified_certify(model, dataset, args, config)
+        purified_certify(model, dataset, args, config, uap_test=args.uap_test, uap=tuap)
     elif args.certify_mode == 'base':
         original_certify(dataset, args, config)
     else:
@@ -459,8 +497,20 @@ def parse_args_and_config():
     parser.add_argument('--use_clustering', action='store_true', help='whether to use clustering when purifying')
     parser.add_argument('--clustering_batch', type=int, default=100)
     parser.add_argument("--clustering_method", type=str, default="none", help="classifier")
-
+    parser.add_argument("--uap_test", type=int, default=0)
+    parser.add_argument("--uap_path", type=str, default="/root/autodl-tmp/sunbing/workspace/uap/my_result/uap_virtual_data.pytorch/uap/cifar10_cifar10_wideresnet_123/")
+    parser.add_argument("--uap_target", type=int, default=0)
     args = parser.parse_args()
+
+    #results/cifar10-densepure-sample_num_100000-noise_$sigma-$steps-steps-$reverse_seed
+    out_file_name = (str(args.domain) + '-' + 'densepure-sample_num' + str(args.N) + '-noise_' +
+                     str(args.sigma) + '-' + str(args.num_t_steps) + '-' + str(args.reverse_seed)
+                     + '-' + str(args.uap_target))
+    args.outfile = os.path.join(args.outfile, out_file_name)
+
+    #exp/cifar10/$sigma-
+    predic_path = str(args.domain) + '/' + str(args.sigma) + '-' + str(args.uap_target) + '-'
+    args.predictions_path = os.path.join(args.predictions_path, predic_path)
 
     # parse config file
     with open(os.path.join('configs', args.config), 'r') as f:
@@ -477,8 +527,11 @@ def parse_args_and_config():
     logger = logging.getLogger()
     logger.addHandler(handler1)
     logger.setLevel(level)
-
-    args.image_folder = os.path.join(args.exp, args.image_folder)
+    #cifar10-densepure-sample_num_100000-noise_$sigma-$steps-$reverse_seed
+    image_file = (str(args.domain) + '-' + 'densepure-sample_num' + str(args.N) + '-noise_' +
+                  str(args.sigma) + '-' + str(args.num_t_steps)+ '-' + str(args.reverse_seed)
+                  + '-' + str(args.uap_target))
+    args.image_folder = os.path.join(args.exp, image_file)
     os.makedirs(args.image_folder, exist_ok=True)
 
     # add device
@@ -501,4 +554,10 @@ def parse_args_and_config():
 if __name__ == '__main__':
     args, config = parse_args_and_config()
     print(args)
+
+    before_time = time()
     robustness_eval(args, config)
+    after_time = time()
+
+    time_elapsed = after_time - before_time
+    print('Total time used for prediction: {}s'.format(time_elapsed))

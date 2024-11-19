@@ -71,7 +71,9 @@ def _cifar10(split: str) -> Dataset:
             transforms.ToTensor()
         ]))
     elif split == "test":
-        return datasets.CIFAR10(dataset_path, train=False, download=True, transform=transforms.ToTensor())
+        test_data = datasets.CIFAR10(dataset_path, train=False, download=True, transform=transforms.ToTensor())
+        #_, test_data = random_split(test_data, 0.99, random_state=42)
+        return test_data
 
     elif split in ["mini_labelled", "mini_unlabelled", "mini_test"]:
         return HybridCifarDataset(split)
@@ -356,3 +358,13 @@ class MultiDatasetsDataLoader(object):
     @property
     def num_tasks(self):
         return len(self.task_data_iters)
+
+def random_split(dataset, ratio=0.9, random_state=None):
+    if random_state is not None:
+        state = torch.random.get_rng_state()
+        torch.random.manual_seed(random_state)
+    n = int(len(dataset) * ratio)
+    split = torch.utils.data.random_split(dataset, [n, len(dataset) - n])
+    if random_state is not None:
+        torch.random.set_rng_state(state)
+    return split
