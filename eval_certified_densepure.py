@@ -30,6 +30,7 @@ class DensePure_Certify(nn.Module):
     def __init__(self, args, config):
         super().__init__()
         self.args = args
+        self.before = time()
 
         # image classifier
         if args.domain == 'cifar10':
@@ -87,7 +88,9 @@ class DensePure_Certify(nn.Module):
     def forward(self, x, sample_id):
         counter = self.counter.item()
         if counter % 100 == 0:
-            print(f'diffusion times: {counter}')
+            time_diff = time() - self.before
+            self.before = time()
+            print(f'diffusion times: {counter}, time {time_diff}s')
 
         start_time = time()
         x_re = self.runner.image_editing_sample((x - 0.5) * 2, bs_id=counter, tag=self.tag, sigma=self.args.sigma)
@@ -356,6 +359,7 @@ def purified_certify(model, dataset, args, config, uap_test=False, uap=None):
             # certify the prediction of g around x
             x = x.cuda()
             label = torch.tensor(label,dtype=torch.int).cuda()
+
             prediction, radius, n0_predictions, n_predictions = smoothed_classifier_diffpure.certify(x, args.N0, args.N, i, args.alpha, args.certified_batch, args.clustering_method)
             after_time = time()
             correct = int(prediction == label)
@@ -385,12 +389,15 @@ def purified_certify(model, dataset, args, config, uap_test=False, uap=None):
             x = x.cuda()
             label = torch.tensor(label,dtype=torch.int).cuda()
             prediction, radius, n0_predictions, n_predictions = smoothed_classifier_diffpure.certify(x, args.N0, args.N, i, args.alpha, args.certified_batch, args.clustering_method)
+            it_time = time()
             if uap_test:
                 prediction_adv, radius, n0_predictions_adv, n_predictions_adv = smoothed_classifier_diffpure.certify(x_adv, args.N0, args.N,
                                                                                                          i, args.alpha,
                                                                                                          args.certified_batch,
                                                                                                          args.clustering_method)
             after_time = time()
+            print('[DEBUG] time for clean sample: {}, time for adv sample: {}'.format(
+                (it_time - before_time), (after_time - it_time)))
             correct = int(prediction == label)
             time_elapsed = str(datetime.timedelta(seconds=(after_time - before_time)))
             if uap_test:
